@@ -339,14 +339,16 @@ private object VaultCrypto {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, getKey(context), GCMParameterSpec(TAG_BITS, iv))
         val encrypted = cipher.doFinal(data)
-        DataOutputStream(FileOutputStream(file)).use { out ->
+        val fos = FileOutputStream(file)
+        DataOutputStream(fos).use { out ->
             out.writeInt(iv.size)
             out.write(iv)
             out.writeUTF(originalName.take(120))
             out.writeInt(encrypted.size)
             out.write(encrypted)
-            out.fd.sync()
+            out.flush()
         }
+        fos.fd.sync()
     }
 
     fun decryptFile(context: Context, file: File): ByteArray {
