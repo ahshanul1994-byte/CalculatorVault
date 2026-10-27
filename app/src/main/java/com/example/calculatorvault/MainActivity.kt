@@ -1,11 +1,19 @@
 package com.example.calculatorvault
 
+import android.Manifest
+import android.app.Activity
+import android.app.RecoverableSecurityException
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
 import android.view.WindowManager
+import android.webkit.MimeTypeMap
+import android.widget.Toast
+import androidx.core.content.FileProvider
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -88,10 +96,33 @@ private fun VaultApp(context: Context, unlockState: MutableState<Boolean>) {
     var message by remember { mutableStateOf("") }
     var refresh by remember { mutableIntStateOf(0) }
 
-    // Launcher for Android 11+ system delete dialog
+    // Holds uris still waiting for an original-file delete attempt (used across
+    // the two possible permission/launcher round-trips below).
+    var pendingDelete by remember { mutableStateOf<List<Uri>>(emptyList()) }
+
+    // Launcher for the Android 11+ system "allow delete?" dialog AND the
+    // Android 10 per-item RecoverableSecurityException confirmation.
     val deleteLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
-    ) { refresh++ }
+    ) { result ->
+        refresh++
+        if (result.resultCode != Activity.RESULT_OK) {
+            message = "Vault-এ কপি হয়েছে, কিন্তু অরিজিনাল ফাইল গ্যালারি থেকে মুছতে অনুমতি দেওয়া হয়নি"
+        }
+    }
+
+    // Android 6–9 (API 23–28) needs a runtime WRITE_EXTERNAL_STORAGE grant
+    // before the originals can be deleted via ContentResolver.
+    val writePermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted && pendingDelete.isNotEmpty()) {
+            deleteOriginals(context, pendingDelete, deleteLauncher)
+        } else if (!granted) {
+            message = "Vault-এ কপি হয়েছে, কিন্তু স্টোরেজ পারমিশন না থাকায় গ্যালারি থেকে অরিজিনাল ফাইল মুছতে পারিনি"
+        }
+        pendingDelete = emptyList()
+    }
 
     // File picker
     val picker = rememberLauncherForActivityResult(
@@ -109,7 +140,18 @@ private fun VaultApp(context: Context, unlockState: MutableState<Boolean>) {
                 }
             } catch (_: Exception) { }
         }
-        if (toDelete.isNotEmpty()) deleteOriginals(context, toDelete, deleteLauncher)
+        if (toDelete.isNotEmpty()) {
+            val needsRuntimePermission =
+                Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+                context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
+                    PackageManager.PERMISSION_GRANTED
+            if (needsRuntimePermission) {
+                pendingDelete = toDelete
+                writePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            } else {
+                deleteOriginals(context, toDelete, deleteLauncher)
+            }
+        }
         message = "$imported টি ফাইল Vault-এ যোগ হয়েছে"
         refresh++
     }
@@ -125,7 +167,12 @@ private fun VaultApp(context: Context, unlockState: MutableState<Boolean>) {
                     refresh  = refresh,
                     message  = message,
                     onRefresh = { refresh++ },
-                    onAdd    = { picker.launch(arrayOf("image/*", "video/*")) },
+                    onAdd    = {
+                        picker.launch(arrayOf(
+                            "image/*", "video/*",
+                            "application/vnd.android.package-archive"
+                        ))
+                    },
                     onLock   = {
                         unlocked = false
                         currentInput = ""; display = "0"
@@ -329,7 +376,8 @@ private fun deleteOriginals(
     launcher: androidx.activity.result.ActivityResultLauncher<IntentSenderRequest>
 ) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        // Android 11+: convert document URIs → MediaStore URIs, then show system delete dialog
+        // Android 11+: convert document URIs → MediaStore URIs, then show the
+        // single system "allow delete?" dialog for all of them at once.
         val mediaUris = uris.mapNotNull { uri ->
             try { android.provider.MediaStore.getMediaUri(context, uri) } catch (_: Exception) { null }
         }
@@ -338,14 +386,43 @@ private fun deleteOriginals(
                 val req = android.provider.MediaStore.createDeleteRequest(context.contentResolver, mediaUris)
                 launcher.launch(IntentSenderRequest.Builder(req.intentSender).build())
                 return
-            } catch (_: Exception) { }
+            } catch (_: Exception) { /* fall through to direct delete below */ }
         }
     }
-    // Fallback: direct deletion via DocumentsContract / ContentResolver
-    uris.forEach { uri ->
-        try { DocumentsContract.deleteDocument(context.contentResolver, uri) }
-        catch (_: Exception) {
-            try { context.contentResolver.delete(uri, null, null) } catch (_: Exception) { }
+    deleteDirect(context, uris, launcher)
+}
+
+/**
+ * Direct deletion path for Android ≤10 (and as a fallback for R+ when the
+ * batch delete request couldn't be built).
+ *
+ * On Android 10 (Q), ContentResolver.delete() on a media item the app didn't
+ * create throws RecoverableSecurityException instead of just failing — that
+ * exception carries an IntentSender that shows the user a one-time "allow
+ * delete?" prompt. Previously this was being swallowed by a blanket
+ * catch-all, so the prompt never appeared and the original file silently
+ * stayed in the gallery. Each such prompt is launched in turn (the system
+ * only allows one outstanding IntentSender launch at a time).
+ */
+private fun deleteDirect(
+    context: Context,
+    uris: List<Uri>,
+    launcher: androidx.activity.result.ActivityResultLauncher<IntentSenderRequest>
+) {
+    for (uri in uris) {
+        try {
+            val rows = context.contentResolver.delete(uri, null, null)
+            if (rows <= 0) {
+                // Some providers return 0 instead of throwing; try SAF deleteDocument too.
+                try { DocumentsContract.deleteDocument(context.contentResolver, uri) } catch (_: Exception) { }
+            }
+        } catch (e: RecoverableSecurityException) {
+            try {
+                val sender = e.userAction.actionIntent.intentSender
+                launcher.launch(IntentSenderRequest.Builder(sender).build())
+            } catch (_: Exception) { }
+        } catch (_: Exception) {
+            try { DocumentsContract.deleteDocument(context.contentResolver, uri) } catch (_: Exception) { }
         }
     }
 }
@@ -492,6 +569,9 @@ private fun VaultScreen(
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 items(files) { file ->
+                    val displayName = remember(file) {
+                        runCatching { VaultCrypto.readOriginalName(file) }.getOrDefault(file.name)
+                    }
                     Column(
                         Modifier
                             .background(Panel, RoundedCornerShape(14.dp))
@@ -501,7 +581,7 @@ private fun VaultScreen(
                         Text("\uD83D\uDD12", fontSize = 32.sp)
                         Spacer(Modifier.height(8.dp))
                         Text(
-                            file.name.removeSuffix(".vault").take(30),
+                            displayName.take(30),
                             color = White, fontSize = 12.sp, maxLines = 2
                         )
                         Text("${file.length() / 1024} KB", color = Color.Gray, fontSize = 11.sp)
@@ -512,19 +592,28 @@ private fun VaultScreen(
     }
 
     selected?.let { f ->
+        val displayName = remember(f) {
+            runCatching { VaultCrypto.readOriginalName(f) }.getOrDefault(f.name)
+        }
         AlertDialog(
             onDismissRequest = { selected = null },
             containerColor   = Panel,
             title = { Text("Vault ফাইল", color = White) },
-            text  = { Text(f.name.removeSuffix(".vault"), color = Color.Gray) },
+            text  = { Text(displayName, color = Color.Gray) },
             confirmButton = {
-                TextButton(onClick = {
-                    runCatching { f.delete() }
-                    selected = null; onRefresh()
-                }) { Text("মুছুন", color = Color(0xFFFF453A)) }
+                Row {
+                    TextButton(onClick = {
+                        openVaultFile(context, f)
+                        selected = null
+                    }) { Text("খুলুন", color = Orange) }
+                    TextButton(onClick = {
+                        runCatching { f.delete() }
+                        selected = null; onRefresh()
+                    }) { Text("মুছুন", color = Color(0xFFFF453A)) }
+                }
             },
             dismissButton = {
-                TextButton(onClick = { selected = null }) { Text("বন্ধ", color = Orange) }
+                TextButton(onClick = { selected = null }) { Text("বন্ধ", color = White) }
             }
         )
     }
@@ -586,5 +675,52 @@ private object VaultCrypto {
             cipher.init(Cipher.DECRYPT_MODE, getKey(context), GCMParameterSpec(TAG_BITS, iv))
             return cipher.doFinal(enc)
         }
+    }
+
+    /** Reads just the stored original file name, without decrypting the content. */
+    fun readOriginalName(file: File): String {
+        DataInputStream(FileInputStream(file)).use { inp ->
+            val ivLen = inp.readInt()
+            inp.skipBytes(ivLen)
+            return inp.readUTF()
+        }
+    }
+
+    /**
+     * Decrypts [file] into a private cache folder (cacheDir/preview) so it can be
+     * opened in an external viewer via FileProvider. Old cached previews are
+     * cleared first so decrypted plaintext never lingers on disk.
+     * Returns the decrypted File plus its original (readable) file name.
+     */
+    fun decryptToCache(context: Context, file: File): Pair<File, String> {
+        val originalName = readOriginalName(file)
+        val data = decryptFile(context, file)
+        val cacheDir = File(context.cacheDir, "preview").apply { mkdirs() }
+        cacheDir.listFiles()?.forEach { it.delete() }
+        val outFile = File(cacheDir, safeName(originalName))
+        FileOutputStream(outFile).use { it.write(data) }
+        return outFile to originalName
+    }
+}
+
+private fun mimeTypeFor(fileName: String): String {
+    val ext = fileName.substringAfterLast('.', "").lowercase()
+    return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
+}
+
+private fun openVaultFile(context: Context, file: File) {
+    try {
+        val (decrypted, originalName) = VaultCrypto.decryptToCache(context, file)
+        val uri = FileProvider.getUriForFile(
+            context, "${context.packageName}.fileprovider", decrypted
+        )
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mimeTypeFor(originalName))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    } catch (_: Exception) {
+        Toast.makeText(context, "ফাইলটি খোলা যায়নি — এটি খোলার মতো কোনো অ্যাপ নেই হয়তো", Toast.LENGTH_SHORT).show()
     }
 }
