@@ -3,13 +3,17 @@ package com.example.calculatorvault
 import android.Manifest
 import android.app.Activity
 import android.app.RecoverableSecurityException
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
+import android.provider.MediaStore
+import android.util.Size
 import android.view.WindowManager
 import android.webkit.MimeTypeMap
 import android.widget.Toast
@@ -19,6 +23,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -31,12 +36,17 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import android.util.Base64
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.*
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -99,6 +109,38 @@ private fun VaultApp(context: Context, unlockState: MutableState<Boolean>) {
     // Holds uris still waiting for an original-file delete attempt (used across
     // the two possible permission/launcher round-trips below).
     var pendingDelete by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var showMediaPicker by remember { mutableStateOf(false) }
+
+    // Imports the given media items (already real MediaStore uris from our own
+    // picker below), then tries to delete each original.
+    fun importMedia(items: List<MediaItem>, deleteLauncher: androidx.activity.result.ActivityResultLauncher<IntentSenderRequest>, writePermissionLauncher: androidx.activity.result.ActivityResultLauncher<String>) {
+        var imported = 0
+        val toDelete = mutableListOf<Uri>()
+        items.forEach { item ->
+            try {
+                context.contentResolver.openInputStream(item.uri)?.use { stream ->
+                    val bytes = stream.readBytes()
+                    VaultCrypto.encryptToFile(context, safeName(item.name), bytes)
+                    imported++
+                    toDelete.add(item.uri)
+                }
+            } catch (_: Exception) { }
+        }
+        if (toDelete.isNotEmpty()) {
+            val needsRuntimePermission =
+                Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+                context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
+                    PackageManager.PERMISSION_GRANTED
+            if (needsRuntimePermission) {
+                pendingDelete = toDelete
+                writePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            } else {
+                deleteOriginals(context, toDelete, deleteLauncher)
+            }
+        }
+        message = "$imported টি ফাইল Vault-এ যোগ হয়েছে"
+        refresh++
+    }
 
     // Launcher for the Android 11+ system "allow delete?" dialog AND the
     // Android 10 per-item RecoverableSecurityException confirmation.
@@ -124,35 +166,40 @@ private fun VaultApp(context: Context, unlockState: MutableState<Boolean>) {
         pendingDelete = emptyList()
     }
 
-    // File picker
-    val picker = rememberLauncherForActivityResult(
+    // Runtime permission needed to QUERY MediaStore ourselves (READ_MEDIA_* on
+    // API 33+, READ_EXTERNAL_STORAGE on API 23–32). Without this grant, the
+    // in-app media picker can't list anything.
+    val readMediaPermissions =
+        if (Build.VERSION.SDK_INT >= 33)
+            arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
+        else
+            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+
+    val readMediaPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        if (results.values.all { it }) {
+            showMediaPicker = true
+        } else {
+            message = "ছবি/ভিডিও দেখতে গ্যালারি পারমিশন দরকার"
+        }
+    }
+
+    // SAF picker — used only for APK files (these aren't part of MediaStore).
+    val apkPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
         var imported = 0
-        val toDelete = mutableListOf<Uri>()
         uris.forEach { uri ->
             try {
                 context.contentResolver.openInputStream(uri)?.use { stream ->
                     val bytes = stream.readBytes()
-                    VaultCrypto.encryptToFile(context, safeName(uri.lastPathSegment ?: "file"), bytes)
+                    VaultCrypto.encryptToFile(context, safeName(uri.lastPathSegment ?: "file.apk"), bytes)
                     imported++
-                    toDelete.add(uri)
                 }
             } catch (_: Exception) { }
         }
-        if (toDelete.isNotEmpty()) {
-            val needsRuntimePermission =
-                Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
-                context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
-                    PackageManager.PERMISSION_GRANTED
-            if (needsRuntimePermission) {
-                pendingDelete = toDelete
-                writePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-            } else {
-                deleteOriginals(context, toDelete, deleteLauncher)
-            }
-        }
-        message = "$imported টি ফাইল Vault-এ যোগ হয়েছে"
+        message = "$imported টি APK Vault-এ যোগ হয়েছে"
         refresh++
     }
 
@@ -167,11 +214,15 @@ private fun VaultApp(context: Context, unlockState: MutableState<Boolean>) {
                     refresh  = refresh,
                     message  = message,
                     onRefresh = { refresh++ },
-                    onAdd    = {
-                        picker.launch(arrayOf(
-                            "image/*", "video/*",
-                            "application/vnd.android.package-archive"
-                        ))
+                    onAddMedia = {
+                        val allGranted = readMediaPermissions.all {
+                            context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+                        }
+                        if (allGranted) showMediaPicker = true
+                        else readMediaPermissionLauncher.launch(readMediaPermissions)
+                    },
+                    onAddApk = {
+                        apkPicker.launch(arrayOf("application/vnd.android.package-archive"))
                     },
                     onLock   = {
                         unlocked = false
@@ -180,6 +231,16 @@ private fun VaultApp(context: Context, unlockState: MutableState<Boolean>) {
                         waitingSecond = false; justEvaluated = false
                     }
                 )
+                if (showMediaPicker) {
+                    MediaPickerScreen(
+                        context  = context,
+                        onCancel = { showMediaPicker = false },
+                        onImport = { items ->
+                            showMediaPicker = false
+                            importMedia(items, deleteLauncher, writePermissionLauncher)
+                        }
+                    )
+                }
             } else {
                 CalculatorScreen(
                     display  = display,
@@ -376,8 +437,17 @@ private fun deleteOriginals(
     launcher: androidx.activity.result.ActivityResultLauncher<IntentSenderRequest>
 ) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        // Android 11+: convert document URIs → MediaStore URIs, then show the
-        // single system "allow delete?" dialog for all of them at once.
+        // Normal case: these are already real MediaStore content:// uris
+        // (they came from our own MediaStore-backed picker), so use them
+        // directly — one system "allow delete?" dialog covers all of them.
+        try {
+            val req = android.provider.MediaStore.createDeleteRequest(context.contentResolver, uris)
+            launcher.launch(IntentSenderRequest.Builder(req.intentSender).build())
+            return
+        } catch (_: Exception) { /* fall through */ }
+
+        // Fallback for anything that wasn't already a MediaStore uri (e.g. a
+        // SAF document uri from an older flow): try converting it first.
         val mediaUris = uris.mapNotNull { uri ->
             try { android.provider.MediaStore.getMediaUri(context, uri) } catch (_: Exception) { null }
         }
@@ -522,7 +592,8 @@ private fun VaultScreen(
     refresh: Int,
     message: String,
     onRefresh: () -> Unit,
-    onAdd: () -> Unit,
+    onAddMedia: () -> Unit,
+    onAddApk: () -> Unit,
     onLock: () -> Unit
 ) {
     val files    = remember(refresh) { VaultCrypto.listFiles(context) }
@@ -542,11 +613,19 @@ private fun VaultScreen(
         }
         Spacer(Modifier.height(16.dp))
         Button(
-            onClick   = onAdd,
+            onClick   = onAddMedia,
             modifier  = Modifier.fillMaxWidth(),
             colors    = ButtonDefaults.buttonColors(containerColor = Orange)
         ) {
-            Text("+ ফাইল যোগ করুন (গ্যালারি থেকে)", color = Color.Black, fontWeight = FontWeight.Bold)
+            Text("+ ছবি/ভিডিও যোগ করুন (গ্যালারি থেকে)", color = Color.Black, fontWeight = FontWeight.Bold)
+        }
+        Spacer(Modifier.height(8.dp))
+        Button(
+            onClick   = onAddApk,
+            modifier  = Modifier.fillMaxWidth(),
+            colors    = ButtonDefaults.buttonColors(containerColor = FnGray)
+        ) {
+            Text("+ APK যোগ করুন", color = White, fontWeight = FontWeight.Bold)
         }
         if (message.isNotBlank()) {
             Spacer(Modifier.height(8.dp))
@@ -616,6 +695,154 @@ private fun VaultScreen(
                 TextButton(onClick = { selected = null }) { Text("বন্ধ", color = White) }
             }
         )
+    }
+}
+
+// ─── In-app media picker (queries MediaStore directly) ───────────────────────
+//
+// We deliberately do NOT use the system "Files" document picker for images
+// and videos: when a user browses folders through it, the uri it returns is
+// sometimes a generic SAF document uri rather than a real MediaStore uri, and
+// MediaStore.getMediaUri() can't always convert it back — so the delete
+// request for the original never gets created (no popup, original file stays
+// in the gallery). Querying MediaStore ourselves guarantees a real, directly
+// deletable content:// uri for every item shown here.
+
+private data class MediaItem(
+    val uri: Uri,
+    val name: String,
+    val isVideo: Boolean,
+    val dateAdded: Long
+)
+
+private const val MEDIA_QUERY_LIMIT = 600
+
+private fun queryDeviceMedia(context: Context): List<MediaItem> {
+    val items = mutableListOf<MediaItem>()
+    val projection = arrayOf(
+        MediaStore.MediaColumns._ID,
+        MediaStore.MediaColumns.DISPLAY_NAME,
+        MediaStore.MediaColumns.DATE_ADDED
+    )
+
+    fun query(collection: Uri, isVideo: Boolean) {
+        context.contentResolver.query(
+            collection, projection, null, null,
+            "${MediaStore.MediaColumns.DATE_ADDED} DESC"
+        )?.use { cursor ->
+            val idCol   = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+            val nameCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+            val dateCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_ADDED)
+            var count = 0
+            while (cursor.moveToNext() && count < MEDIA_QUERY_LIMIT) {
+                val id = cursor.getLong(idCol)
+                val uri = ContentUris.withAppendedId(collection, id)
+                items.add(MediaItem(uri, cursor.getString(nameCol) ?: "file", isVideo, cursor.getLong(dateCol)))
+                count++
+            }
+        }
+    }
+
+    query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, isVideo = false)
+    query(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, isVideo = true)
+    return items.sortedByDescending { it.dateAdded }
+}
+
+private fun loadThumb(context: Context, uri: Uri): Bitmap? = try {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        context.contentResolver.loadThumbnail(uri, Size(200, 200), null)
+    } else null
+} catch (_: Exception) { null }
+
+@Composable
+private fun MediaPickerScreen(
+    context: Context,
+    onCancel: () -> Unit,
+    onImport: (List<MediaItem>) -> Unit
+) {
+    var loading by remember { mutableStateOf(true) }
+    var items by remember { mutableStateOf<List<MediaItem>>(emptyList()) }
+    val selected = remember { mutableStateListOf<MediaItem>() }
+
+    LaunchedEffect(Unit) {
+        items = withContext(Dispatchers.IO) { queryDeviceMedia(context) }
+        loading = false
+    }
+
+    Column(Modifier.fillMaxSize().background(Bg).padding(18.dp)) {
+        Spacer(Modifier.height(16.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onCancel) { Text("বাতিল", color = Orange) }
+            Spacer(Modifier.weight(1f))
+            Text(
+                if (selected.isEmpty()) "ছবি/ভিডিও বাছুন" else "${selected.size} টি সিলেক্ট করা হয়েছে",
+                color = White, fontSize = 15.sp
+            )
+            Spacer(Modifier.weight(1f))
+            TextButton(
+                onClick = { onImport(selected.toList()) },
+                enabled = selected.isNotEmpty()
+            ) { Text("যোগ করুন", color = if (selected.isNotEmpty()) Orange else Color.Gray) }
+        }
+        Spacer(Modifier.height(12.dp))
+
+        when {
+            loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = Orange)
+            }
+            items.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("ফোনে কোনো ছবি/ভিডিও পাওয়া যায়নি", color = Color.Gray)
+            }
+            else -> LazyVerticalGrid(
+                columns = GridCells.Fixed(3),
+                verticalArrangement   = Arrangement.spacedBy(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                items(items) { item ->
+                    val isSelected = item in selected
+                    val thumb = remember(item.uri) { loadThumb(context, item.uri) }
+                    Box(
+                        Modifier
+                            .aspectRatio(1f)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Panel)
+                            .clickable {
+                                if (isSelected) selected.remove(item) else selected.add(item)
+                            }
+                    ) {
+                        if (thumb != null) {
+                            Image(
+                                bitmap = thumb.asImageBitmap(),
+                                contentDescription = item.name,
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Crop
+                            )
+                        } else {
+                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                Text(if (item.isVideo) "\uD83C\uDFA5" else "\uD83D\uDDBC", fontSize = 28.sp)
+                            }
+                        }
+                        if (item.isVideo) {
+                            Text(
+                                "\uD83C\uDFA5", fontSize = 14.sp,
+                                modifier = Modifier.align(Alignment.BottomStart).padding(4.dp)
+                            )
+                        }
+                        Box(
+                            Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(4.dp)
+                                .size(20.dp)
+                                .clip(CircleShape)
+                                .background(if (isSelected) Orange else Color.Black.copy(alpha = 0.45f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (isSelected) Text("✓", color = Color.Black, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
