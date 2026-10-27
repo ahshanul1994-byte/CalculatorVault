@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Calculator icon foreground — safe zone: 72×72dp centred in 108×108dp viewport
+  (i.e. content sits between x=18..90, y=18..90)
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Calculator body (orange rounded rect) -->
+    <path
+        android:fillColor="#FF9F0A"
+        android:pathData="
+          M38,18
+          L70,18
+          C76,18 82,24 82,30
+          L82,80
+          C82,86 76,92 70,92
+          L38,92
+          C32,92 26,86 26,80
+          L26,30
+          C26,24 32,18 38,18
+          Z"/>
+
+    <!-- Display background (dark) -->
+    <path
+        android:fillColor="#0D0F17"
+        android:pathData="M32,24 L76,24 L76,46 L32,46 Z"/>
+
+    <!-- Display: orange number block (right-aligned, like "0") -->
+    <path
+        android:fillColor="#FF9F0A"
+        android:pathData="M54,30 L72,30 L72,32 L54,32 Z"/>
+    <path
+        android:fillColor="#FF9F0A"
+        android:pathData="M54,38 L72,38 L72,40 L54,40 Z"/>
+    <path
+        android:fillColor="#FF9F0A"
+        android:pathData="M54,30 L56,30 L56,40 L54,40 Z"/>
+    <path
+        android:fillColor="#FF9F0A"
+        android:pathData="M70,30 L72,30 L72,40 L70,40 Z"/>
+
+    <!-- ── Button grid ── -->
+    <!-- Row 1 (gray function keys + orange operator) -->
+    <path android:fillColor="#2C2C2E" android:pathData="M32,50 L41,50 L41,58 L32,58 Z"/>
+    <path android:fillColor="#2C2C2E" android:pathData="M43,50 L52,50 L52,58 L43,58 Z"/>
+    <path android:fillColor="#2C2C2E" android:pathData="M54,50 L63,50 L63,58 L54,58 Z"/>
+    <path android:fillColor="#CC7A00" android:pathData="M65,50 L76,50 L76,58 L65,58 Z"/>
+
+    <!-- Row 2 (dark digit keys + orange operator) -->
+    <path android:fillColor="#1C1C1E" android:pathData="M32,61 L41,61 L41,69 L32,69 Z"/>
+    <path android:fillColor="#1C1C1E" android:pathData="M43,61 L52,61 L52,69 L43,69 Z"/>
+    <path android:fillColor="#1C1C1E" android:pathData="M54,61 L63,61 L63,69 L54,69 Z"/>
+    <path android:fillColor="#CC7A00" android:pathData="M65,61 L76,61 L76,69 L65,69 Z"/>
+
+    <!-- Row 3 (dark digit keys + wide orange = key) -->
+    <path android:fillColor="#1C1C1E" android:pathData="M32,72 L41,72 L41,80 L32,80 Z"/>
+    <path android:fillColor="#1C1C1E" android:pathData="M43,72 L52,72 L52,80 L43,80 Z"/>
+    <path android:fillColor="#CC7A00" android:pathData="M54,72 L76,72 L76,80 L54,80 Z"/>
+</vector>
