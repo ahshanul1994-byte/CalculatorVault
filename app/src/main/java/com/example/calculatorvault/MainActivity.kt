@@ -2,952 +2,341 @@ package com.example.calculatorvault
 
 import android.Manifest
 import android.app.Activity
-import android.app.RecoverableSecurityException
-import android.content.ContentUris
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
-import android.provider.MediaStore
-import android.util.Size
 import android.view.WindowManager
-import android.webkit.MimeTypeMap
 import android.widget.Toast
-import androidx.core.content.FileProvider
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import android.util.Base64
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.*
-import java.security.MessageDigest
-import java.security.SecureRandom
-import javax.crypto.Cipher
-import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
-import kotlin.math.abs
-import kotlin.math.floor
-
-private val Bg      = Color(0xFF000000)
-private val Panel   = Color(0xFF1C1C1E)
-private val Orange  = Color(0xFFFF9F0A)
-private val FnGray  = Color(0xFF2C2C2E)
-private val White   = Color(0xFFFFFFFF)
-
-private const val PREFS   = "vault_setup"
-private const val PIN_HASH = "pin_hash"
-private const val SALT    = "pin_salt"
-private const val KEY_B64 = "vault_key"
+import java.io.File
 
 class MainActivity : ComponentActivity() {
-    private val _unlocked = mutableStateOf(false)
+    private val unlocked = mutableStateOf(false)
+
+    /** Set right before we open another app/screen on purpose (file picker, installer) so the vault stays open. */
+    var suppressLock = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Block screenshots and recent-app previews
-        window.setFlags(
-            WindowManager.LayoutParams.FLAG_SECURE,
-            WindowManager.LayoutParams.FLAG_SECURE
-        )
-        setContent { VaultApp(this, _unlocked) }
+        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        setContent { VaultApp(this, unlocked) }
     }
 
-    // Auto-lock vault whenever app leaves the foreground
+    override fun onResume() {
+        super.onResume()
+        suppressLock = false
+    }
+
+    // Leaving the app (home, recents, screen off, another app) → lock again.
     override fun onStop() {
         super.onStop()
-        _unlocked.value = false
+        if (!suppressLock) lockNow()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        CacheDirs.clear(this)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        CacheDirs.clear(this)
+    }
+
+    private fun lockNow() {
+        unlocked.value = false
+        VaultKeys.clear()
     }
 }
-
-// ─── Main composable ─────────────────────────────────────────────────────────
 
 @Composable
-private fun VaultApp(context: Context, unlockState: MutableState<Boolean>) {
-    val prefs       = remember { context.getSharedPreferences(PREFS, Context.MODE_PRIVATE) }
-    var configured  by remember { mutableStateOf(prefs.contains(PIN_HASH)) }
-    var unlocked    by unlockState
-
-    // Calculator state
-    var display         by remember { mutableStateOf("0") }
-    var currentInput    by remember { mutableStateOf("") }
-    var firstOperand    by remember { mutableStateOf<Double?>(null) }
-    var pendingOp       by remember { mutableStateOf<String?>(null) }
-    var waitingSecond   by remember { mutableStateOf(false) }
-    var justEvaluated   by remember { mutableStateOf(false) }
-
-    var message by remember { mutableStateOf("") }
-    var refresh by remember { mutableIntStateOf(0) }
-
-    // Holds uris still waiting for an original-file delete attempt (used across
-    // the two possible permission/launcher round-trips below).
-    var pendingDelete by remember { mutableStateOf<List<Uri>>(emptyList()) }
-    var showMediaPicker by remember { mutableStateOf(false) }
-
-    // Imports the given media items (already real MediaStore uris from our own
-    // picker below), then tries to delete each original.
-    fun importMedia(items: List<MediaItem>, deleteLauncher: androidx.activity.result.ActivityResultLauncher<IntentSenderRequest>, writePermissionLauncher: androidx.activity.result.ActivityResultLauncher<String>) {
-        var imported = 0
-        val toDelete = mutableListOf<Uri>()
-        items.forEach { item ->
-            try {
-                context.contentResolver.openInputStream(item.uri)?.use { stream ->
-                    val bytes = stream.readBytes()
-                    VaultCrypto.encryptToFile(context, safeName(item.name), bytes)
-                    imported++
-                    toDelete.add(item.uri)
-                }
-            } catch (_: Exception) { }
-        }
-        if (toDelete.isNotEmpty()) {
-            val needsRuntimePermission =
-                Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
-                context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
-                    PackageManager.PERMISSION_GRANTED
-            if (needsRuntimePermission) {
-                pendingDelete = toDelete
-                writePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-            } else {
-                deleteOriginals(context, toDelete, deleteLauncher)
-            }
-        }
-        message = "$imported টি ফাইল Vault-এ যোগ হয়েছে"
-        refresh++
-    }
-
-    // Launcher for the Android 11+ system "allow delete?" dialog AND the
-    // Android 10 per-item RecoverableSecurityException confirmation.
-    val deleteLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartIntentSenderForResult()
-    ) { result ->
-        refresh++
-        if (result.resultCode != Activity.RESULT_OK) {
-            message = "Vault-এ কপি হয়েছে, কিন্তু অরিজিনাল ফাইল গ্যালারি থেকে মুছতে অনুমতি দেওয়া হয়নি"
-        }
-    }
-
-    // Android 6–9 (API 23–28) needs a runtime WRITE_EXTERNAL_STORAGE grant
-    // before the originals can be deleted via ContentResolver.
-    val writePermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted && pendingDelete.isNotEmpty()) {
-            deleteOriginals(context, pendingDelete, deleteLauncher)
-        } else if (!granted) {
-            message = "Vault-এ কপি হয়েছে, কিন্তু স্টোরেজ পারমিশন না থাকায় গ্যালারি থেকে অরিজিনাল ফাইল মুছতে পারিনি"
-        }
-        pendingDelete = emptyList()
-    }
-
-    // Runtime permission needed to QUERY MediaStore ourselves (READ_MEDIA_* on
-    // API 33+, READ_EXTERNAL_STORAGE on API 23–32). Without this grant, the
-    // in-app media picker can't list anything.
-    val readMediaPermissions =
-        if (Build.VERSION.SDK_INT >= 33)
-            arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
-        else
-            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
-
-    val readMediaPermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { results ->
-        if (results.values.all { it }) {
-            showMediaPicker = true
-        } else {
-            message = "ছবি/ভিডিও দেখতে গ্যালারি পারমিশন দরকার"
-        }
-    }
-
-    // SAF picker — used only for APK files (these aren't part of MediaStore).
-    val apkPicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenMultipleDocuments()
-    ) { uris ->
-        var imported = 0
-        uris.forEach { uri ->
-            try {
-                context.contentResolver.openInputStream(uri)?.use { stream ->
-                    val bytes = stream.readBytes()
-                    VaultCrypto.encryptToFile(context, safeName(uri.lastPathSegment ?: "file.apk"), bytes)
-                    imported++
-                }
-            } catch (_: Exception) { }
-        }
-        message = "$imported টি APK Vault-এ যোগ হয়েছে"
-        refresh++
-    }
-
-    MaterialTheme(colorScheme = darkColorScheme(
-        background = Bg, surface = Panel, primary = Orange,
-        onBackground = White, onSurface = White
-    )) {
-        Surface(Modifier.fillMaxSize(), color = Bg) {
-            if (unlocked) {
-                VaultScreen(
-                    context  = context,
-                    refresh  = refresh,
-                    message  = message,
-                    onRefresh = { refresh++ },
-                    onAddMedia = {
-                        val allGranted = readMediaPermissions.all {
-                            context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
-                        }
-                        if (allGranted) showMediaPicker = true
-                        else readMediaPermissionLauncher.launch(readMediaPermissions)
-                    },
-                    onAddApk = {
-                        apkPicker.launch(arrayOf("application/vnd.android.package-archive"))
-                    },
-                    onLock   = {
-                        unlocked = false
-                        currentInput = ""; display = "0"
-                        firstOperand = null; pendingOp = null
-                        waitingSecond = false; justEvaluated = false
-                    }
-                )
-                if (showMediaPicker) {
-                    MediaPickerScreen(
-                        context  = context,
-                        onCancel = { showMediaPicker = false },
-                        onImport = { items ->
-                            showMediaPicker = false
-                            importMedia(items, deleteLauncher, writePermissionLauncher)
-                        }
-                    )
-                }
-            } else {
-                CalculatorScreen(
-                    display  = display,
-                    isSetup  = !configured,
-                    message  = message,
-                    onKey    = { key ->
-                        message = ""
-                        handleKey(
-                            key, context, prefs, configured,
-                            display, currentInput,
-                            firstOperand, pendingOp,
-                            waitingSecond, justEvaluated,
-                            onDisplayChange     = { display = it },
-                            onInputChange       = { currentInput = it },
-                            onFirstOpChange     = { firstOperand = it },
-                            onPendingOpChange   = { pendingOp = it },
-                            onWaitingChange     = { waitingSecond = it },
-                            onEvaluatedChange   = { justEvaluated = it },
-                            onMessage           = { message = it },
-                            onConfigured        = { configured = it },
-                            onUnlock            = { unlocked = it }
-                        )
-                    }
-                )
-            }
-        }
-    }
-}
-
-// ─── Key handler (extracted to keep composable clean) ────────────────────────
-
-private fun handleKey(
-    key: String,
-    context: Context,
-    prefs: android.content.SharedPreferences,
-    configured: Boolean,
-    display: String,
-    currentInput: String,
-    firstOperand: Double?,
-    pendingOp: String?,
-    waitingSecond: Boolean,
-    justEvaluated: Boolean,
-    onDisplayChange: (String) -> Unit,
-    onInputChange: (String) -> Unit,
-    onFirstOpChange: (Double?) -> Unit,
-    onPendingOpChange: (String?) -> Unit,
-    onWaitingChange: (Boolean) -> Unit,
-    onEvaluatedChange: (Boolean) -> Unit,
-    onMessage: (String) -> Unit,
-    onConfigured: (Boolean) -> Unit,
-    onUnlock: (Boolean) -> Unit
-) {
-    fun setNum(v: String) { onInputChange(v); onDisplayChange(v.ifEmpty { "0" }) }
-    fun reset() {
-        onInputChange(""); onDisplayChange("0")
-        onFirstOpChange(null); onPendingOpChange(null)
-        onWaitingChange(false); onEvaluatedChange(false)
-    }
-
-    when (key) {
-        "C" -> reset()
-
-        "⌫" -> {
-            if (!justEvaluated && currentInput.isNotEmpty()) {
-                val s = currentInput.dropLast(1)
-                onInputChange(s); onDisplayChange(s.ifEmpty { "0" })
-            } else {
-                onInputChange(""); onDisplayChange("0"); onEvaluatedChange(false)
-            }
-        }
-
-        "+/−" -> {
-            currentInput.toDoubleOrNull()?.let {
-                val s = formatNum(-it); onInputChange(s); onDisplayChange(s)
-            }
-            onEvaluatedChange(false)
-        }
-
-        "%" -> {
-            currentInput.toDoubleOrNull()?.let {
-                val s = formatNum(it / 100.0); onInputChange(s); onDisplayChange(s)
-            }
-            onEvaluatedChange(false)
-        }
-
-        "÷", "×", "−", "+" -> {
-            val v = currentInput.toDoubleOrNull() ?: display.toDoubleOrNull() ?: 0.0
-            if (firstOperand != null && !waitingSecond && pendingOp != null) {
-                val r = calc(firstOperand!!, pendingOp!!, v)
-                onFirstOpChange(r); onDisplayChange(formatNum(r))
-            } else {
-                onFirstOpChange(v)
-            }
-            onPendingOpChange(key)
-            onWaitingChange(true)
-            onInputChange("")
-            onEvaluatedChange(false)
-        }
-
-        "." -> {
-            if (justEvaluated) { onInputChange("0."); onDisplayChange("0."); onEvaluatedChange(false) }
-            else if (!currentInput.contains('.')) {
-                val s = if (currentInput.isEmpty()) "0." else "$currentInput."
-                onInputChange(s); onDisplayChange(s)
-            }
-        }
-
-        "=" -> {
-            // If current input is exactly 6 digits → treat as PIN attempt
-            if (currentInput.all { it.isDigit() } && currentInput.length == 6) {
-                if (!configured) {
-                    setupPin(prefs, currentInput)
-                    onConfigured(true); onUnlock(true)
-                    reset(); onMessage("PIN সেট হয়েছে")
-                } else {
-                    val salt     = Base64.decode(prefs.getString(SALT, ""), Base64.NO_WRAP)
-                    val expected = Base64.decode(prefs.getString(PIN_HASH, ""), Base64.NO_WRAP)
-                    if (PinSecurity.verify(currentInput, salt, expected)) {
-                        onUnlock(true); reset()
-                    } else {
-                        // Wrong PIN → silently show calculator result
-                        if (firstOperand != null && pendingOp != null) {
-                            val v = currentInput.toDoubleOrNull() ?: 0.0
-                            val r = calc(firstOperand!!, pendingOp!!, v)
-                            val s = formatNum(r)
-                            onDisplayChange(s); onInputChange(s)
-                            onFirstOpChange(null); onPendingOpChange(null)
-                        }
-                        onEvaluatedChange(true)
-                        onWaitingChange(false)
-                    }
-                }
-            } else {
-                // Normal calculation
-                if (firstOperand != null && pendingOp != null) {
-                    val v = currentInput.toDoubleOrNull() ?: firstOperand!!
-                    val r = calc(firstOperand!!, pendingOp!!, v)
-                    val s = formatNum(r)
-                    onDisplayChange(s); onInputChange(s)
-                    onFirstOpChange(null); onPendingOpChange(null)
-                    onWaitingChange(false); onEvaluatedChange(true)
-                }
-            }
-        }
-
-        else -> { // digit
-            if (key.length == 1 && key[0].isDigit()) {
-                val s = when {
-                    justEvaluated || waitingSecond -> key
-                    currentInput == "0"            -> key
-                    currentInput.length >= 12      -> return
-                    else                           -> currentInput + key
-                }
-                onWaitingChange(false); onEvaluatedChange(false)
-                onInputChange(s); onDisplayChange(s)
-            }
-        }
-    }
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-private fun calc(a: Double, op: String, b: Double): Double = when (op) {
-    "+" -> a + b
-    "−" -> a - b
-    "×" -> a * b
-    "÷" -> if (b != 0.0) a / b else Double.NaN
-    else -> b
-}
-
-private fun formatNum(v: Double): String {
-    if (v.isNaN() || v.isInfinite()) return "Error"
-    return if (v == floor(v) && abs(v) < 1e12) v.toLong().toString()
-    else "%.10g".format(v).trimEnd('0').trimEnd('.')
-}
-
-private fun safeName(raw: String): String =
-    raw.substringAfterLast('/').substringAfterLast(':')
-        .replace(Regex("[^A-Za-z0-9._-]"), "_").take(80).ifBlank { "vault_file" }
-
-private fun setupPin(prefs: android.content.SharedPreferences, pin: String) {
-    val salt     = ByteArray(16).also { SecureRandom().nextBytes(it) }
-    val keyBytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
-    prefs.edit()
-        .putString(PIN_HASH, Base64.encodeToString(PinSecurity.hash(pin, salt), Base64.NO_WRAP))
-        .putString(SALT,     Base64.encodeToString(salt, Base64.NO_WRAP))
-        .putString(KEY_B64,  Base64.encodeToString(keyBytes, Base64.NO_WRAP))
-        .apply()
-}
-
-private fun deleteOriginals(
-    context: Context,
-    uris: List<Uri>,
-    launcher: androidx.activity.result.ActivityResultLauncher<IntentSenderRequest>
-) {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        // Normal case: these are already real MediaStore content:// uris
-        // (they came from our own MediaStore-backed picker), so use them
-        // directly — one system "allow delete?" dialog covers all of them.
-        try {
-            val req = android.provider.MediaStore.createDeleteRequest(context.contentResolver, uris)
-            launcher.launch(IntentSenderRequest.Builder(req.intentSender).build())
-            return
-        } catch (_: Exception) { /* fall through */ }
-
-        // Fallback for anything that wasn't already a MediaStore uri (e.g. a
-        // SAF document uri from an older flow): try converting it first.
-        val mediaUris = uris.mapNotNull { uri ->
-            try { android.provider.MediaStore.getMediaUri(context, uri) } catch (_: Exception) { null }
-        }
-        if (mediaUris.isNotEmpty()) {
-            try {
-                val req = android.provider.MediaStore.createDeleteRequest(context.contentResolver, mediaUris)
-                launcher.launch(IntentSenderRequest.Builder(req.intentSender).build())
-                return
-            } catch (_: Exception) { /* fall through to direct delete below */ }
-        }
-    }
-    deleteDirect(context, uris, launcher)
-}
-
-/**
- * Direct deletion path for Android ≤10 (and as a fallback for R+ when the
- * batch delete request couldn't be built).
- *
- * On Android 10 (Q), ContentResolver.delete() on a media item the app didn't
- * create throws RecoverableSecurityException instead of just failing — that
- * exception carries an IntentSender that shows the user a one-time "allow
- * delete?" prompt. Previously this was being swallowed by a blanket
- * catch-all, so the prompt never appeared and the original file silently
- * stayed in the gallery. Each such prompt is launched in turn (the system
- * only allows one outstanding IntentSender launch at a time).
- */
-private fun deleteDirect(
-    context: Context,
-    uris: List<Uri>,
-    launcher: androidx.activity.result.ActivityResultLauncher<IntentSenderRequest>
-) {
-    for (uri in uris) {
-        try {
-            val rows = context.contentResolver.delete(uri, null, null)
-            if (rows <= 0) {
-                // Some providers return 0 instead of throwing; try SAF deleteDocument too.
-                try { DocumentsContract.deleteDocument(context.contentResolver, uri) } catch (_: Exception) { }
-            }
-        } catch (e: RecoverableSecurityException) {
-            try {
-                val sender = e.userAction.actionIntent.intentSender
-                launcher.launch(IntentSenderRequest.Builder(sender).build())
-            } catch (_: Exception) { }
-        } catch (_: Exception) {
-            try { DocumentsContract.deleteDocument(context.contentResolver, uri) } catch (_: Exception) { }
-        }
-    }
-}
-
-// ─── UI: Calculator ───────────────────────────────────────────────────────────
-
-@Composable
-private fun CalculatorScreen(
-    display: String,
-    isSetup: Boolean,
-    message: String,
-    onKey: (String) -> Unit
-) {
-    Column(
-        Modifier
-            .fillMaxSize()
-            .background(Bg)
-            .padding(horizontal = 16.dp)
-            .padding(bottom = 28.dp),
-        verticalArrangement = Arrangement.SpaceBetween
+private fun VaultApp(activity: MainActivity, unlocked: MutableState<Boolean>) {
+    MaterialTheme(
+        colorScheme = darkColorScheme(background = Bg, surface = Panel, primary = Orange, onBackground = White, onSurface = White)
     ) {
-        // Display area
-        Column(
-            Modifier
-                .fillMaxWidth()
-                .padding(top = 52.dp, end = 6.dp),
-            horizontalAlignment = Alignment.End
-        ) {
-            if (isSetup) {
-                Text(
-                    "প্রথমবার: ৬ সংখ্যার PIN দিন, তারপর =",
-                    color = Orange.copy(alpha = 0.75f),
-                    fontSize = 12.sp
-                )
-                Spacer(Modifier.height(4.dp))
-            }
-            Text(
-                text = display,
-                color = White,
-                fontSize = if (display.length > 9) 38.sp else 68.sp,
-                fontWeight = FontWeight.Thin,
-                textAlign = TextAlign.End,
-                maxLines = 1
-            )
-            if (message.isNotBlank()) {
-                Spacer(Modifier.height(4.dp))
-                Text(message, color = Orange, fontSize = 13.sp, textAlign = TextAlign.End)
-            }
-        }
-
-        // Button grid
-        val rows = listOf(
-            listOf("C", "+/−", "%", "÷"),
-            listOf("7", "8",   "9", "×"),
-            listOf("4", "5",   "6", "−"),
-            listOf("1", "2",   "3", "+"),
-            listOf("⌫", "0",   ".", "=")
-        )
-        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            rows.forEach { row ->
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    row.forEach { key ->
-                        val isOp = key in listOf("÷", "×", "−", "+", "=")
-                        val isFn = key in listOf("C", "+/−", "%", "⌫")
-                        val bg   = when { isOp -> Orange; isFn -> FnGray; else -> Panel }
-                        val fg   = if (isOp) Color.Black else White
-                        Box(
-                            Modifier
-                                .weight(1f)
-                                .aspectRatio(1f)
-                                .background(bg, CircleShape)
-                                .clickable { onKey(key) },
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text       = key,
-                                color      = fg,
-                                fontSize   = 26.sp,
-                                fontWeight = FontWeight.Normal
-                            )
-                        }
-                    }
+        Surface(Modifier.fillMaxSize(), color = Bg) {
+            Box(Modifier.fillMaxSize().background(Bg).systemBarsPadding()) {
+                if (unlocked.value) {
+                    VaultHost(activity, onLock = { unlocked.value = false; VaultKeys.clear() })
+                } else {
+                    CalculatorHost(activity, onUnlock = { unlocked.value = true })
                 }
             }
         }
     }
 }
 
-// ─── UI: Vault ────────────────────────────────────────────────────────────────
+// ─── Calculator + PIN handling ───────────────────────────────────────────────
 
 @Composable
-private fun VaultScreen(
-    context: Context,
-    refresh: Int,
-    message: String,
-    onRefresh: () -> Unit,
-    onAddMedia: () -> Unit,
-    onAddApk: () -> Unit,
-    onLock: () -> Unit
-) {
-    val files    = remember(refresh) { VaultCrypto.listFiles(context) }
-    var selected by remember { mutableStateOf<File?>(null) }
+private fun CalculatorHost(context: Context, onUnlock: () -> Unit) {
+    val calc = remember { Calc() }
+    var configured by remember { mutableStateOf(PinStore.isConfigured(context)) }
+    var firstPin by remember { mutableStateOf<String?>(null) }
+    var message by remember { mutableStateOf("") }
 
-    Column(Modifier.fillMaxSize().background(Bg).padding(18.dp)) {
-        Spacer(Modifier.height(16.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text("PRIVATE VAULT", color = White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                Text("${files.size} টি ফাইল এনক্রিপ্টেড", color = Color.Gray, fontSize = 13.sp)
-            }
-            Button(
-                onClick = onLock,
-                colors  = ButtonDefaults.buttonColors(containerColor = FnGray)
-            ) { Text("LOCK", color = White) }
-        }
-        Spacer(Modifier.height(16.dp))
-        Button(
-            onClick   = onAddMedia,
-            modifier  = Modifier.fillMaxWidth(),
-            colors    = ButtonDefaults.buttonColors(containerColor = Orange)
-        ) {
-            Text("+ ছবি/ভিডিও যোগ করুন (গ্যালারি থেকে)", color = Color.Black, fontWeight = FontWeight.Bold)
-        }
-        Spacer(Modifier.height(8.dp))
-        Button(
-            onClick   = onAddApk,
-            modifier  = Modifier.fillMaxWidth(),
-            colors    = ButtonDefaults.buttonColors(containerColor = FnGray)
-        ) {
-            Text("+ APK যোগ করুন", color = White, fontWeight = FontWeight.Bold)
-        }
-        if (message.isNotBlank()) {
-            Spacer(Modifier.height(8.dp))
-            Text(message, color = Orange, fontSize = 13.sp)
-        }
-        Spacer(Modifier.height(16.dp))
-        if (files.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text(
-                    "এখনো কোনো ফাইল নেই\n\nউপরে \"+ ফাইল যোগ করুন\" চাপুন\nছবি/ভিডিও বেছে নিলে Vault-এ যোগ হবে\nএবং গ্যালারি থেকে সরে যাবে",
-                    color = Color.Gray,
-                    textAlign = TextAlign.Center,
-                    lineHeight = 22.sp
-                )
-            }
-        } else {
-            LazyVerticalGrid(
-                columns = GridCells.Fixed(2),
-                verticalArrangement   = Arrangement.spacedBy(10.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                items(files) { file ->
-                    val displayName = remember(file) {
-                        runCatching { VaultCrypto.readOriginalName(file) }.getOrDefault(file.name)
+    CalculatorScreen(
+        display = calc.display,
+        hint = if (!configured && firstPin == null) "প্রথমবার: ৬ সংখ্যার PIN দিন, তারপর =" else null,
+        message = message,
+        onKey = { key ->
+            message = ""
+            if (key != "=") {
+                calc.press(key)
+            } else {
+                val pin = calc.pinCandidate()
+                if (pin == null) {
+                    calc.equalsKey()
+                } else if (!configured) {
+                    val f = firstPin
+                    if (f == null) {
+                        firstPin = pin; calc.reset(); message = "আবার একই PIN দিন, তারপর ="
+                    } else if (f == pin) {
+                        PinStore.setPin(context, pin)
+                        configured = true; firstPin = null; calc.reset(); onUnlock()
+                    } else {
+                        firstPin = null; calc.reset(); message = "PIN মেলেনি — আবার প্রথম থেকে দিন"
                     }
-                    Column(
-                        Modifier
-                            .background(Panel, RoundedCornerShape(14.dp))
-                            .clickable { selected = file }
-                            .padding(16.dp)
-                    ) {
-                        Text("\uD83D\uDD12", fontSize = 32.sp)
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            displayName.take(30),
-                            color = White, fontSize = 12.sp, maxLines = 2
-                        )
-                        Text("${file.length() / 1024} KB", color = Color.Gray, fontSize = 11.sp)
-                    }
+                } else if (PinStore.verify(context, pin, countFailure = !calc.hasPendingOp())) {
+                    calc.reset(); onUnlock()
+                } else {
+                    // Wrong PIN: behave exactly like a normal calculator.
+                    calc.equalsKey(); calc.markEvaluated()
                 }
             }
         }
-    }
-
-    selected?.let { f ->
-        val displayName = remember(f) {
-            runCatching { VaultCrypto.readOriginalName(f) }.getOrDefault(f.name)
-        }
-        AlertDialog(
-            onDismissRequest = { selected = null },
-            containerColor   = Panel,
-            title = { Text("Vault ফাইল", color = White) },
-            text  = { Text(displayName, color = Color.Gray) },
-            confirmButton = {
-                Row {
-                    TextButton(onClick = {
-                        openVaultFile(context, f)
-                        selected = null
-                    }) { Text("খুলুন", color = Orange) }
-                    TextButton(onClick = {
-                        runCatching { f.delete() }
-                        selected = null; onRefresh()
-                    }) { Text("মুছুন", color = Color(0xFFFF453A)) }
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { selected = null }) { Text("বন্ধ", color = White) }
-            }
-        )
-    }
-}
-
-// ─── In-app media picker (queries MediaStore directly) ───────────────────────
-//
-// We deliberately do NOT use the system "Files" document picker for images
-// and videos: when a user browses folders through it, the uri it returns is
-// sometimes a generic SAF document uri rather than a real MediaStore uri, and
-// MediaStore.getMediaUri() can't always convert it back — so the delete
-// request for the original never gets created (no popup, original file stays
-// in the gallery). Querying MediaStore ourselves guarantees a real, directly
-// deletable content:// uri for every item shown here.
-
-private data class MediaItem(
-    val uri: Uri,
-    val name: String,
-    val isVideo: Boolean,
-    val dateAdded: Long
-)
-
-private const val MEDIA_QUERY_LIMIT = 600
-
-private fun queryDeviceMedia(context: Context): List<MediaItem> {
-    val items = mutableListOf<MediaItem>()
-    val projection = arrayOf(
-        MediaStore.MediaColumns._ID,
-        MediaStore.MediaColumns.DISPLAY_NAME,
-        MediaStore.MediaColumns.DATE_ADDED
     )
-
-    fun query(collection: Uri, isVideo: Boolean) {
-        context.contentResolver.query(
-            collection, projection, null, null,
-            "${MediaStore.MediaColumns.DATE_ADDED} DESC"
-        )?.use { cursor ->
-            val idCol   = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
-            val nameCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
-            val dateCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_ADDED)
-            var count = 0
-            while (cursor.moveToNext() && count < MEDIA_QUERY_LIMIT) {
-                val id = cursor.getLong(idCol)
-                val uri = ContentUris.withAppendedId(collection, id)
-                items.add(MediaItem(uri, cursor.getString(nameCol) ?: "file", isVideo, cursor.getLong(dateCol)))
-                count++
-            }
-        }
-    }
-
-    query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, isVideo = false)
-    query(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, isVideo = true)
-    return items.sortedByDescending { it.dateAdded }
 }
 
-private fun loadThumb(context: Context, uri: Uri): Bitmap? = try {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        context.contentResolver.loadThumbnail(uri, Size(200, 200), null)
-    } else null
-} catch (_: Exception) { null }
+// ─── Vault host: permissions, importing, deleting originals, restoring ──────
+
+/** Like OpenMultipleDocuments, but also asks for write access so the original can be deleted. */
+private class PickDocs : ActivityResultContract<Array<String>, List<Uri>>() {
+    override fun createIntent(context: Context, input: Array<String>): Intent =
+        Intent(Intent.ACTION_OPEN_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("*/*")
+            .putExtra(Intent.EXTRA_MIME_TYPES, input)
+            .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+
+    override fun parseResult(resultCode: Int, intent: Intent?): List<Uri> {
+        if (resultCode != Activity.RESULT_OK || intent == null) return emptyList()
+        val out = LinkedHashSet<Uri>()
+        intent.data?.let { out.add(it) }
+        intent.clipData?.let { cd -> for (i in 0 until cd.itemCount) cd.getItemAt(i).uri?.let { out.add(it) } }
+        return out.toList()
+    }
+}
 
 @Composable
-private fun MediaPickerScreen(
-    context: Context,
-    onCancel: () -> Unit,
-    onImport: (List<MediaItem>) -> Unit
-) {
-    var loading by remember { mutableStateOf(true) }
-    var items by remember { mutableStateOf<List<MediaItem>>(emptyList()) }
-    val selected = remember { mutableStateListOf<MediaItem>() }
+private fun VaultHost(activity: MainActivity, onLock: () -> Unit) {
+    val context: Context = activity
+    val scope = rememberCoroutineScope()
 
-    LaunchedEffect(Unit) {
-        items = withContext(Dispatchers.IO) { queryDeviceMedia(context) }
-        loading = false
+    var refresh by remember { mutableIntStateOf(0) }
+    var message by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf<String?>(null) }
+    var showPicker by remember { mutableStateOf(false) }
+    var viewing by remember { mutableStateOf<File?>(null) }
+    var filter by remember { mutableStateOf<VType?>(null) }
+    var restorePending by remember { mutableStateOf<File?>(null) }
+
+    val deleter = remember {
+        Deleter(context) { deleted, failed ->
+            refresh++
+            message = if (failed == 0) {
+                "মূল ফাইল ফোন থেকে মুছে গেছে ($deleted টি)। Google Photos ব্যাকআপ চালু থাকলে ক্লাউডের কপি আলাদা মুছুন।"
+            } else {
+                "Vault-এ যোগ হয়েছে, কিন্তু $failed টি মূল ফাইল মুছতে অনুমতি পাওয়া যায়নি"
+            }
+        }
+    }
+    val deleteLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { r ->
+        deleter.onResult(r.resultCode == Activity.RESULT_OK)
+    }
+    deleter.launcher = deleteLauncher
+
+    fun importMedia(items: List<PickItem>) {
+        scope.launch {
+            var ok = 0
+            var fail = 0
+            val toDelete = mutableListOf<Uri>()
+            for ((i, item) in items.withIndex()) {
+                busy = "Vault-এ যোগ হচ্ছে ${i + 1}/${items.size} …"
+                val success = withContext(Dispatchers.IO) { importOne(context, item.uri, item.name, item.type) }
+                if (success) { ok++; toDelete.add(item.uri) } else fail++
+            }
+            busy = null
+            refresh++
+            message = "$ok টি ফাইল Vault-এ যোগ হয়েছে" + if (fail > 0) " ($fail টি ব্যর্থ)" else ""
+            if (toDelete.isNotEmpty()) deleter.start(toDelete)
+        }
     }
 
-    Column(Modifier.fillMaxSize().background(Bg).padding(18.dp)) {
-        Spacer(Modifier.height(16.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onCancel) { Text("বাতিল", color = Orange) }
-            Spacer(Modifier.weight(1f))
-            Text(
-                if (selected.isEmpty()) "ছবি/ভিডিও বাছুন" else "${selected.size} টি সিলেক্ট করা হয়েছে",
-                color = White, fontSize = 15.sp
-            )
-            Spacer(Modifier.weight(1f))
-            TextButton(
-                onClick = { onImport(selected.toList()) },
-                enabled = selected.isNotEmpty()
-            ) { Text("যোগ করুন", color = if (selected.isNotEmpty()) Orange else Color.Gray) }
-        }
-        Spacer(Modifier.height(12.dp))
-
-        when {
-            loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(color = Orange)
-            }
-            items.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("ফোনে কোনো ছবি/ভিডিও পাওয়া যায়নি", color = Color.Gray)
-            }
-            else -> LazyVerticalGrid(
-                columns = GridCells.Fixed(3),
-                verticalArrangement   = Arrangement.spacedBy(6.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                items(items) { item ->
-                    val isSelected = item in selected
-                    val thumb = remember(item.uri) { loadThumb(context, item.uri) }
-                    Box(
-                        Modifier
-                            .aspectRatio(1f)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Panel)
-                            .clickable {
-                                if (isSelected) selected.remove(item) else selected.add(item)
-                            }
-                    ) {
-                        if (thumb != null) {
-                            Image(
-                                bitmap = thumb.asImageBitmap(),
-                                contentDescription = item.name,
-                                modifier = Modifier.fillMaxSize(),
-                                contentScale = ContentScale.Crop
-                            )
-                        } else {
-                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                Text(if (item.isVideo) "\uD83C\uDFA5" else "\uD83D\uDDBC", fontSize = 28.sp)
-                            }
-                        }
-                        if (item.isVideo) {
-                            Text(
-                                "\uD83C\uDFA5", fontSize = 14.sp,
-                                modifier = Modifier.align(Alignment.BottomStart).padding(4.dp)
-                            )
-                        }
-                        Box(
-                            Modifier
-                                .align(Alignment.TopEnd)
-                                .padding(4.dp)
-                                .size(20.dp)
-                                .clip(CircleShape)
-                                .background(if (isSelected) Orange else Color.Black.copy(alpha = 0.45f)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            if (isSelected) Text("✓", color = Color.Black, fontSize = 12.sp)
-                        }
-                    }
+    fun importDocs(uris: List<Uri>) {
+        scope.launch {
+            var ok = 0
+            var fail = 0
+            var notDeleted = 0
+            for ((i, u) in uris.withIndex()) {
+                busy = "Vault-এ যোগ হচ্ছে ${i + 1}/${uris.size} …"
+                val (success, deleted) = withContext(Dispatchers.IO) {
+                    val n = queryName(context, u)
+                    val s = importOne(context, u, n, typeOf(n))
+                    val d = s && runCatching { DocumentsContract.deleteDocument(context.contentResolver, u) }
+                        .getOrDefault(false)
+                    s to d
                 }
+                if (success) { ok++; if (!deleted) notDeleted++ } else fail++
             }
-        }
-    }
-}
-
-// ─── Security ────────────────────────────────────────────────────────────────
-
-private object PinSecurity {
-    fun hash(pin: String, salt: ByteArray): ByteArray =
-        MessageDigest.getInstance("SHA-256").also { it.update(salt) }
-            .digest(pin.toByteArray(Charsets.UTF_8))
-
-    fun verify(pin: String, salt: ByteArray, expected: ByteArray): Boolean =
-        MessageDigest.isEqual(hash(pin, salt), expected)
-}
-
-private object VaultCrypto {
-    private const val DIR            = "vault"
-    private const val TRANSFORMATION = "AES/GCM/NoPadding"
-    private const val TAG_BITS       = 128
-
-    private fun getKey(context: Context): javax.crypto.SecretKey {
-        val prefs   = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val encoded = prefs.getString(KEY_B64, null) ?: error("Vault key missing")
-        return SecretKeySpec(Base64.decode(encoded, Base64.NO_WRAP), "AES")
-    }
-
-    fun listFiles(context: Context): List<File> =
-        File(context.filesDir, DIR).listFiles()
-            ?.filter { it.isFile && it.name.endsWith(".vault") }
-            ?.sortedByDescending { it.lastModified() } ?: emptyList()
-
-    fun encryptToFile(context: Context, originalName: String, data: ByteArray) {
-        val dir = File(context.filesDir, DIR).apply { mkdirs() }
-        val id  = "${System.currentTimeMillis()}_${originalName.hashCode().toUInt().toString(16)}"
-        val file = File(dir, "$id.vault")
-        val iv   = ByteArray(12).also { SecureRandom().nextBytes(it) }
-        val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, getKey(context), GCMParameterSpec(TAG_BITS, iv))
-        val encrypted = cipher.doFinal(data)
-        val fos = FileOutputStream(file)
-        DataOutputStream(fos).use { out ->
-            out.writeInt(iv.size); out.write(iv)
-            out.writeUTF(originalName.take(120))
-            out.writeInt(encrypted.size); out.write(encrypted)
-            out.flush()
-        }
-        fos.fd.sync()
-    }
-
-    fun decryptFile(context: Context, file: File): ByteArray {
-        DataInputStream(FileInputStream(file)).use { inp ->
-            val ivLen = inp.readInt(); require(ivLen == 12) { "Invalid IV" }
-            val iv = ByteArray(ivLen); inp.readFully(iv)
-            inp.readUTF()
-            val size = inp.readInt(); require(size in 16..(512 * 1024 * 1024))
-            val enc = ByteArray(size); inp.readFully(enc)
-            val cipher = Cipher.getInstance(TRANSFORMATION)
-            cipher.init(Cipher.DECRYPT_MODE, getKey(context), GCMParameterSpec(TAG_BITS, iv))
-            return cipher.doFinal(enc)
+            busy = null
+            refresh++
+            message = "$ok টি ফাইল Vault-এ যোগ হয়েছে" +
+                (if (fail > 0) " ($fail টি ব্যর্থ)" else "") +
+                (if (notDeleted > 0) "। $notDeleted টির মূল কপি মুছতে পারিনি — ফাইল অ্যাপ থেকে নিজে মুছুন" else "")
         }
     }
 
-    /** Reads just the stored original file name, without decrypting the content. */
-    fun readOriginalName(file: File): String {
-        DataInputStream(FileInputStream(file)).use { inp ->
-            val ivLen = inp.readInt()
-            inp.skipBytes(ivLen)
-            return inp.readUTF()
+    fun doRestore(f: File) {
+        scope.launch {
+            busy = "ফোনে ফেরত আনা হচ্ছে …"
+            val ok = withContext(Dispatchers.IO) {
+                restoreToDevice(context, f).also { if (it) VaultCrypto.deleteWithThumb(f) }
+            }
+            busy = null
+            refresh++
+            message = if (ok) "ফেরত এসেছে — গ্যালারি/Music/Download এর \"Restored\" ফোল্ডারে দেখুন" else "ফেরত আনা যায়নি"
         }
     }
 
-    /**
-     * Decrypts [file] into a private cache folder (cacheDir/preview) so it can be
-     * opened in an external viewer via FileProvider. Old cached previews are
-     * cleared first so decrypted plaintext never lingers on disk.
-     * Returns the decrypted File plus its original (readable) file name.
-     */
-    fun decryptToCache(context: Context, file: File): Pair<File, String> {
-        val originalName = readOriginalName(file)
-        val data = decryptFile(context, file)
-        val cacheDir = File(context.cacheDir, "preview").apply { mkdirs() }
-        cacheDir.listFiles()?.forEach { it.delete() }
-        val outFile = File(cacheDir, safeName(originalName))
-        FileOutputStream(outFile).use { it.write(data) }
-        return outFile to originalName
+    val writePermLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val f = restorePending
+        restorePending = null
+        if (granted && f != null) doRestore(f) else message = "স্টোরেজ পারমিশন ছাড়া ফেরত আনা যাবে না"
     }
-}
 
-private fun mimeTypeFor(fileName: String): String {
-    val ext = fileName.substringAfterLast('.', "").lowercase()
-    return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
-}
+    val readPerms: Array<String> = remember {
+        when {
+            Build.VERSION.SDK_INT >= 33 -> arrayOf(
+                Manifest.permission.READ_MEDIA_IMAGES,
+                Manifest.permission.READ_MEDIA_VIDEO,
+                Manifest.permission.READ_MEDIA_AUDIO
+            )
+            Build.VERSION.SDK_INT >= 29 -> arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+            else -> arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
+    }
+    val readPermLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { res ->
+        if (res.values.any { it }) showPicker = true else message = "ছবি/ভিডিও/অডিও দেখতে পারমিশন দরকার"
+    }
+    val docPicker = rememberLauncherForActivityResult(PickDocs()) { uris ->
+        if (uris.isNotEmpty()) importDocs(uris)
+    }
 
-private fun openVaultFile(context: Context, file: File) {
-    try {
-        val (decrypted, originalName) = VaultCrypto.decryptToCache(context, file)
-        val uri = FileProvider.getUriForFile(
-            context, "${context.packageName}.fileprovider", decrypted
+    fun openExternal(f: File) {
+        scope.launch {
+            busy = "খোলা হচ্ছে …"
+            val r = withContext(Dispatchers.IO) { runCatching { VaultCrypto.decryptToCache(context, f, "preview") } }
+            busy = null
+            r.onSuccess { out ->
+                try {
+                    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", out)
+                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(uri, mimeFor(out.name))
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    activity.suppressLock = true
+                    context.startActivity(intent)
+                } catch (_: ActivityNotFoundException) {
+                    activity.suppressLock = false
+                    Toast.makeText(context, "এই ফাইল খোলার মতো কোনো অ্যাপ নেই", Toast.LENGTH_SHORT).show()
+                } catch (_: Exception) {
+                    activity.suppressLock = false
+                    message = "ফাইলটি খোলা যায়নি"
+                }
+            }.onFailure { message = "ফাইলটি খোলা যায়নি" }
+        }
+    }
+
+    BackHandler {
+        when {
+            viewing != null -> viewing = null
+            showPicker -> showPicker = false
+            else -> onLock()
+        }
+    }
+
+    val v = viewing
+    when {
+        v != null -> ViewerScreen(context, v, onClose = { viewing = null })
+        showPicker -> PickerScreen(
+            context,
+            onCancel = { showPicker = false },
+            onImport = { items -> showPicker = false; importMedia(items) }
         )
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, mimeTypeFor(originalName))
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        context.startActivity(intent)
-    } catch (_: Exception) {
-        Toast.makeText(context, "ফাইলটি খোলা যায়নি — এটি খোলার মতো কোনো অ্যাপ নেই হয়তো", Toast.LENGTH_SHORT).show()
+        else -> VaultScreen(
+            context = context,
+            refresh = refresh,
+            message = message,
+            filter = filter,
+            onFilter = { filter = it },
+            onAddMedia = {
+                if (readPerms.any { context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) showPicker = true
+                else readPermLauncher.launch(readPerms)
+            },
+            onAddFiles = {
+                activity.suppressLock = true
+                docPicker.launch(arrayOf("*/*"))
+            },
+            onView = { viewing = it },
+            onOpenExternal = { openExternal(it) },
+            onRestore = { f ->
+                if (Build.VERSION.SDK_INT < 29 &&
+                    context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    restorePending = f
+                    writePermLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                } else doRestore(f)
+            },
+            onDelete = { f -> VaultCrypto.deleteWithThumb(f); refresh++; message = "মুছে ফেলা হয়েছে" },
+            onChangePin = { pin -> PinStore.setPin(context, pin); message = "PIN বদলানো হয়েছে" },
+            onLock = onLock
+        )
+    }
+
+    busy?.let { text ->
+        AlertDialog(
+            onDismissRequest = {},
+            confirmButton = {},
+            title = { Text(text) },
+            text = { CircularProgressIndicator() }
+        )
     }
 }
